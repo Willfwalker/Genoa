@@ -1,121 +1,305 @@
+from langgraph.graph import StateGraph, START, END
+from langchain_google_vertexai import ChatVertexAI
+from langchain.chains import LLMChain
+from langchain.prompts import PromptTemplate
+from langchain.memory import ConversationBufferMemory
+from langchain.agents import AgentExecutor, create_react_agent
+from langchain.tools import Tool
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langgraph.checkpoint.postgres import PostgresCheckpointer
 import os
 from dotenv import load_dotenv
-import google.generativeai as genai
-from Canvas_Context import CanvasManager
+import uuid
+from typing import Dict, List, Any, Optional, TypedDict, Annotated
+import logging
+from typing_extensions import NotRequired
 
-class GenoaAI:
-    def __init__(self):
-        # Load environment variables and initialize Gemini
-        load_dotenv()
-        genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
-        self.model = genai.GenerativeModel('gemini-pro')
-        self.canvas = CanvasManager()
+# Load environment variables
+load_dotenv()
 
-    def analyze_prompt(self, user_prompt, course_id=None):
-        """Analyze user prompt to determine which Canvas data to fetch"""
-        system_prompt = """
-        You are an AI tutor that analyzes user queries about their Canvas course information.
-        Based on the query, determine which Canvas functions are needed from these options in order to answer the user's question best:
-        - get_current_classes(): Get list of all current classes
-        - get_class_assignments(course_id): Get all assignments for a class
-        - get_class_syllabus(course_id): Get the class syllabus
-        - get_class_grades(course_id): Get grades for a class
-        - get_upcoming_tests(course_id): Get upcoming tests/quizzes
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def get_system_prompt(user: Dict[str, Any], course: Optional[Dict[str, Any]] = None) -> str:
+    """Generate the system prompt for the Genoa AI assistant."""
+    if course:
+        return f"""You are Genoa, an AI teaching assistant for {course.get('name', 'this course')}.
         
-        Respond with a JSON-like structure containing:
-        - functions: list of required function names
+        Current Context:
+        - You are speaking with {user.get('name', 'a student')}
+        - Course: {course.get('name', 'Unknown')}
+        - You have access to the course materials and can answer questions about assignments, deadlines, and content
         
-        Example response:
-        {
-            "functions": ["get_current_classes"]
-        }
+        Guidelines:
+        - Always be helpful, encouraging, and educational
+        - If you don't know something, be honest and offer to find more information
+        - Keep responses concise but informative
+        - Focus on helping students learn and succeed in their coursework
+        """
+    else:
+        return f"""You are Genoa, an AI teaching assistant.
+        
+        Current Context:
+        - You are speaking with {user.get('name', 'a student')}
+        
+        Guidelines:
+        - Always be helpful, encouraging, and educational
+        - If you don't know something, be honest and offer to find more information
+        - Keep responses concise but informative
+        - Focus on helping students learn and succeed in their coursework
         """
 
-        prompt = f"{system_prompt}\n\nUser query: {user_prompt}"
-        
-        try:
-            response = self.model.generate_content(prompt)
-            analysis = response.text
-            
-            # Execute the determined Canvas functions
-            return self._fetch_canvas_data(analysis, course_id)
-            
-        except Exception as e:
-            return f"Error analyzing prompt: {str(e)}"
+# Define state as a TypedDict
+class GenoaState(TypedDict):
+    messages: List[Dict[str, Any]]
+    user: NotRequired[Dict[str, Any]]
+    course: NotRequired[Dict[str, Any]]
+    course_id: NotRequired[str]
+    next: NotRequired[str]
+    canvas_data: NotRequired[Dict[str, Any]]
 
-    def _fetch_canvas_data(self, analysis, course_id):
-        """Fetch the required Canvas data based on the AI analysis"""
-        results = {}
-        
-        if "get_current_classes" in analysis:
-            results['classes'] = self.canvas.get_current_classes()
+# Define state reducers
+def reduce_messages(current_state: List[Dict[str, Any]], new_state: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return current_state + new_state
+
+def reduce_or_keep(current_state: Any, new_state: Any) -> Any:
+    return new_state or current_state
+
+def reduce_dict(current_state: Dict[str, Any], new_state: Dict[str, Any]) -> Dict[str, Any]:
+    if current_state and new_state:
+        return {**current_state, **new_state}
+    return new_state or current_state or {}
+
+def analyze_prompt(state: GenoaState) -> Dict[str, Any]:
+    """Analyze the user prompt to understand the intent and required data."""
+    try:
+        # Get the last message from the user
+        last_message = state["messages"][-1]
+        if last_message.get("type") != "human":
+            return {"next": "generate_response"}
             
+        user_prompt = last_message.get("content", "")
+        
+        # Initialize Gemini model
+        model = ChatVertexAI(
+            model_name="gemini-1.5-pro",
+            temperature=0.2,
+            max_output_tokens=1024,
+        )
+        
+        # Create prompt for analysis
+        analysis_prompt = f"""
+        Analyze the following student query and identify:
+        1. The intent (question about assignment, deadline, course content, etc.)
+        2. Any specific course elements mentioned (assignment names, deadlines, etc.)
+        3. What Canvas data might be needed to answer this query
+        
+        Student query: {user_prompt}
+        
+        Provide your analysis in JSON format:
+        {{
+            "intent": "string",
+            "course_elements": ["string"],
+            "canvas_data_needed": ["string"],
+            "needs_canvas_data": true/false
+        }}
+        """
+        
+        # Get analysis from model
+        analysis_response = model.invoke(analysis_prompt)
+        analysis = analysis_response.content
+        
+        # Extract JSON from response if needed
+        # (Add JSON parsing code here if needed)
+        
+        return {
+            "analysis": analysis,
+            "next": "fetch_canvas" if analysis.get("needs_canvas_data", False) else "generate_response"
+        }
+    except Exception as e:
+        logger.error(f"Error in analyze_prompt: {e}")
+        return {
+            "next": "generate_response",
+            "error": str(e)
+        }
+
+def fetch_canvas_data(state: GenoaState) -> Dict[str, Any]:
+    """Fetch relevant data from Canvas API based on the analysis."""
+    try:
+        analysis = state.get("analysis", {})
+        user_prompt = state["messages"][-1].get("content", "")
+        course_id = state.get("course_id")
+        
+        # Initialize Canvas API connection
+        # (Add Canvas API connection code here)
+        
+        canvas_data = {}
+        
+        # Determine what data to fetch based on analysis
+        data_needed = analysis.get("canvas_data_needed", [])
+        
+        if "assignments" in data_needed:
+            # Fetch assignments from Canvas
+            # canvas_data["assignments"] = ...
+            pass
+            
+        if "deadlines" in data_needed:
+            # Fetch deadlines from Canvas
+            # canvas_data["deadlines"] = ...
+            pass
+            
+        if "course_content" in data_needed:
+            # Fetch course content from Canvas
+            # canvas_data["course_content"] = ...
+            pass
+        
+        return {
+            "canvas_data": canvas_data,
+            "next": "generate_response"
+        }
+    except Exception as e:
+        logger.error(f"Error in fetch_canvas_data: {e}")
+        return {
+            "next": "generate_response",
+            "error": str(e)
+        }
+
+def generate_response(state: GenoaState) -> Dict[str, Any]:
+    """Generate a response using the LLM with all available context."""
+    try:
+        # Get all required data from state
+        messages = state.get("messages", [])
+        user = state.get("user", {})
+        course = state.get("course", {})
+        canvas_data = state.get("canvas_data", {})
+        
+        # Get the last message
+        last_message = messages[-1] if messages else {"content": ""}
+        
+        # Initialize Gemini model
+        model = ChatVertexAI(
+            model_name="gemini-1.5-pro",
+            temperature=0.7,
+        )
+        
+        # Create agent with tools if needed
+        # tools = []
+        agent = create_react_agent(model, [])
+        
+        # Prepare context and messages
+        system_prompt = get_system_prompt(user, course)
+        system_message = SystemMessage(content=system_prompt)
+        
+        # Add Canvas data context if available
+        canvas_context = ""
+        if canvas_data:
+            canvas_context = "Canvas data:\n" + str(canvas_data)
+            canvas_message = SystemMessage(content=canvas_context)
+            context_messages = [system_message, canvas_message]
+        else:
+            context_messages = [system_message]
+        
+        # Convert state messages to langchain message format
+        conversation_messages = []
+        for msg in messages:
+            if msg.get("type") == "human":
+                conversation_messages.append(HumanMessage(content=msg.get("content", "")))
+            elif msg.get("type") == "ai":
+                conversation_messages.append(AIMessage(content=msg.get("content", "")))
+        
+        # Get response from agent
+        agent_response = agent.invoke({
+            "messages": context_messages + conversation_messages
+        })
+        
+        # Format and return the response
+        ai_message = {"type": "ai", "content": agent_response.content}
+        
+        return {
+            "messages": [ai_message],
+            "next": "FINISH"
+        }
+    except Exception as e:
+        logger.error(f"Error in generate_response: {e}")
+        error_message = {"type": "ai", "content": "I'm sorry, I encountered an error while processing your request. Please try again."}
+        return {
+            "messages": [error_message],
+            "next": "FINISH"
+        }
+
+# Create the LangGraph
+genoa_graph = StateGraph(GenoaState)
+
+# Add nodes to the graph
+genoa_graph.add_node("analyze_prompt", analyze_prompt)
+genoa_graph.add_node("fetch_canvas_data", fetch_canvas_data)
+genoa_graph.add_node("generate_response", generate_response)
+
+# Add edges between nodes
+genoa_graph.set_entry_point("analyze_prompt")
+genoa_graph.add_conditional_edges(
+    "analyze_prompt",
+    lambda x: x["next"],
+    {
+        "fetch_canvas": "fetch_canvas_data",
+        "generate_response": "generate_response"
+    }
+)
+genoa_graph.add_edge("fetch_canvas_data", "generate_response")
+genoa_graph.add_edge("generate_response", END)
+
+# Initialize checkpointer for conversation persistence
+checkpointer = None
+try:
+    if os.getenv("POSTGRES_CONNECTION_STRING"):
+        checkpointer = PostgresCheckpointer.from_connection_string(os.getenv("POSTGRES_CONNECTION_STRING"))
+        logger.info("PostgreSQL checkpointing enabled")
+    else:
+        logger.info("No PostgreSQL connection string found, running without checkpointing")
+except ImportError:
+    logger.warning("PostgreSQL checkpointing dependencies not available. To enable checkpointing, install required packages.")
+except Exception as e:
+    logger.error(f"Failed to initialize PostgreSQL checkpointing: {e}")
+
+# Compile the graph
+compiled_genoa_graph = genoa_graph.compile(checkpointer=checkpointer)
+
+# Function to process a query through the graph
+async def process_query(user_prompt: str, course_id: Optional[str] = None, user_info: Optional[Dict[str, Any]] = None):
+    """Process a user query through the Genoa LangGraph."""
+    try:
+        # Initialize state
+        initial_state = {
+            "messages": [{"type": "human", "content": user_prompt}],
+            "course_id": course_id,
+            "user": user_info or {},
+        }
+        
+        # If course_id is provided, get course info
         if course_id:
-            if "get_class_assignments" in analysis:
-                results['assignments'] = self.canvas.get_class_assignments(course_id)
-                
-            if "get_class_syllabus" in analysis:
-                results['syllabus'] = self.canvas.get_class_syllabus(course_id)
-                
-            if "get_class_grades" in analysis:
-                results['grades'] = self.canvas.get_class_grades(course_id)
-                
-            if "get_upcoming_tests" in analysis:
-                results['upcoming_tests'] = self.canvas.get_upcoming_tests(course_id)
+            # Fetch course info from Canvas or database
+            # course_info = ...
+            initial_state["course"] = {} # Replace with actual course info
         
-        return results
-
-    def find_course_id(self, query):
-        courses = self.canvas.get_current_classes()
-        if not courses:
-            return None
+        # Run the graph
+        config = {"configurable": {"userId": user_info.get("id", str(uuid.uuid4()))}} if user_info else {}
+        result = await compiled_genoa_graph.ainvoke(initial_state, config=config)
         
-        # Convert query to lowercase for case-insensitive matching
-        query = query.lower()
-        for course in courses:
-            if any(keyword in course['course_name'].lower() for keyword in query.split()):
-                return course['course_id']
-        return None
-
-    def process_query(self, user_prompt, course_id=None):
-        if not course_id:
-            course_id = self.find_course_id(user_prompt)
-        """Main method to process user queries"""
-        try:
-            # First, analyze the prompt and get Canvas data
-            canvas_data = self.analyze_prompt(user_prompt, course_id)
-            
-            # Create a detailed system prompt that helps the AI understand how to use the Canvas data
-            system_prompt = """
-            You are a helpful academic assistant with access to Canvas course information.
-            Please provide a clear and specific answer based on the available Canvas data.
-            If the data doesn't contain enough information to fully answer the question,
-            acknowledge this and answer with what is available.
-            
-            Format numbers, dates, and important information clearly.
-            If listing multiple items, use bullet points for clarity.
-            """
-            
-            # Construct a detailed context with both the data and instructions
-            context = f"""{system_prompt}
-
-            Available Canvas Data:
-            {str(canvas_data)}
-
-            User Question: {user_prompt}
-
-            Please provide a helpful response using this information."""
-            
-            # Generate the response using the enhanced context
-            response = self.model.generate_content(context)
-            
-            return {
-                'raw_data': canvas_data,
-                'response': response.text
-            }
-            
-        except Exception as e:
-            return f"Error processing query: {str(e)}"
+        # Extract the AI response from the final state
+        ai_messages = [msg for msg in result.get("messages", []) if msg.get("type") == "ai"]
+        ai_response = ai_messages[-1].get("content", "") if ai_messages else ""
+        
+        return {
+            "response": ai_response,
+            "canvas_data": result.get("canvas_data", {}),
+        }
+    except Exception as e:
+        logger.error(f"Error in process_query: {e}")
+        return {
+            "response": "I'm sorry, I encountered an error while processing your request. Please try again.",
+            "error": str(e)
+        }
 
 if __name__ == "__main__":
     genoa = GenoaAI()

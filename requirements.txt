@@ -1,0 +1,13 @@
+langchain
+langchain-core
+langchain-google-vertexai
+langchain-community
+python-dotenv
+google-cloud-aiplatform
+uuid
+typing-extensions
+pydantic
+psycopg2-binary
+langgraph
+sqlalchemy>=2.0.0  # Required for PostgreSQL support in langgraph
+asyncpg  # Required for async PostgreSQL support

@@ -139,3 +139,15 @@ class CanvasManager:
             print(f"Error fetching upcoming tests: {str(e)}")
             return None
 
+
+    def find_course_id(self, class_name):
+        """Find course ID for a given class name"""
+        try:
+            courses = self.canvas.get_courses()
+            for course in courses:
+                if class_name.lower() in course.name.lower():
+                    return course.id
+            return None
+        except Exception as e:
+            print(f"Error finding course ID: {str(e)}")
+            return None
