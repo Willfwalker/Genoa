@@ -141,12 +141,38 @@ class CanvasManager:
 
 
     def find_course_id(self, class_name):
-        """Find course ID for a given class name"""
+        """Find course ID for a given class name with improved matching"""
         try:
+            # Get all courses
             courses = self.canvas.get_courses()
+            
+            # Print available courses for debugging
+            print("Available courses:")
+            for course in courses:
+                print(f"- {course.name} (ID: {course.id})")
+            
+            # Try exact match first
+            for course in courses:
+                if class_name.lower() == course.name.lower():
+                    print(f"Found exact match: {course.name} (ID: {course.id})")
+                    return course.id
+            
+            # Try contains match
             for course in courses:
                 if class_name.lower() in course.name.lower():
+                    print(f"Found partial match: {course.name} (ID: {course.id})")
                     return course.id
+            
+            # Try word-by-word match (for cases like "Discrete Math" matching "Introduction to Discrete Mathematics")
+            class_words = class_name.lower().split()
+            for course in courses:
+                course_name_lower = course.name.lower()
+                # Check if all words in class_name are in the course name
+                if all(word in course_name_lower for word in class_words):
+                    print(f"Found word match: {course.name} (ID: {course.id})")
+                    return course.id
+            
+            print(f"No course found matching '{class_name}'")
             return None
         except Exception as e:
             print(f"Error finding course ID: {str(e)}")
